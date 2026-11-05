@@ -54,7 +54,15 @@ async function signalHost({
   }
 }
 
-// Signals must reach a real process: listener mocks miss exit-hook's persistent handlers (#27478).
+type ListenerCounts = Record<string, number>;
+
+function listenersFrom(stdout: string): Record<'before' | 'connected' | 'disconnected', ListenerCounts | undefined> {
+  const line = stdout.split('\n').find(l => l.startsWith('host: listeners '));
+  if (!line) throw new Error(`Host printed no listener counts: ${stdout}`);
+  return JSON.parse(line.slice('host: listeners '.length));
+}
+
+// Signals must reach a real process: listener mocks can't show whether the host survives (#27478).
 describe.skipIf(process.platform === 'win32')('MCPClient process hooks and host shutdown', () => {
   it.each(['SIGTERM', 'SIGINT', 'SIGHUP'] satisfies NodeJS.Signals[])(
     'lets the host finish awaited cleanup on %s with hooks disabled',
@@ -72,7 +80,35 @@ describe.skipIf(process.platform === 'win32')('MCPClient process hooks and host 
     const result = await signalHost({ hooks: 'false', disconnectFirst: true });
     expect(result.stdout).toContain('host: cleanup finished');
     expect(result.code).toBe(0);
+    const listeners = listenersFrom(result.stdout);
+    expect(listeners.connected).toEqual(listeners.before);
+    expect(listeners.disconnected).toEqual(listeners.before);
   }, 20000);
+
+  // A disconnected client must leave no process listener that ends the host on a signal.
+  it('lets the host finish cleanup on SIGTERM after it disconnected clients that used default hooks', async () => {
+    const result = await signalHost({ hooks: 'default', disconnectFirst: true });
+    expect(result.stdout).toContain('host: cleanup finished');
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeNull();
+    const listeners = listenersFrom(result.stdout);
+    expect(listeners.disconnected).toEqual(listeners.before);
+  }, 20000);
+
+  it.each([
+    ['SIGINT', 130],
+    ['SIGHUP', 129],
+  ] satisfies [NodeJS.Signals, number][])(
+    'ends a host with connected default-hook clients on %s with exit code %i',
+    async (signal, code) => {
+      const result = await signalHost({ hooks: 'default', signal });
+      expect(result.stdout).toContain('host: starting cleanup');
+      expect(result.stdout).not.toContain('host: cleanup finished');
+      expect(result.code).toBe(code);
+      expect(result.signal).toBeNull();
+    },
+    20000,
+  );
 
   it.each(['default', 'true'] as const)(
     'preserves %s SIGTERM exit behavior',

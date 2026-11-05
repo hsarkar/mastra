@@ -13,6 +13,9 @@ const mcp = new MCPClient({
   ...(hooks === 'default' ? {} : { registerProcessHooks: hooks === 'true' }),
 });
 
+const processEvents = ['SIGINT', 'SIGTERM', 'SIGHUP', 'beforeExit', 'exit', 'message'] as const;
+const countListeners = () => Object.fromEntries(processEvents.map(event => [event, process.listenerCount(event)]));
+
 process.once(signal, async () => {
   console.log('host: starting cleanup');
   await mcp.disconnect();
@@ -22,8 +25,14 @@ process.once(signal, async () => {
   process.exit(0);
 });
 
+const listeners: Record<string, Record<string, number>> = { before: countListeners() };
 const { errors } = await mcp.listToolsWithErrors();
 if (Object.keys(errors).length) throw new Error(JSON.stringify(errors));
-if (disconnectFirst === 'true') await mcp.disconnect();
+listeners.connected = countListeners();
+if (disconnectFirst === 'true') {
+  await mcp.disconnect();
+  listeners.disconnected = countListeners();
+}
+console.log(`host: listeners ${JSON.stringify(listeners)}`);
 console.log('host: READY');
 setInterval(() => {}, 1000);

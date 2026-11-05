@@ -33,7 +33,6 @@ import type {
   jsonSchemaValidator,
 } from '@modelcontextprotocol/client';
 import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import { asyncExitHook, gracefulExit } from 'exit-hook';
 import { z } from 'zod/v4';
 import {
   EVENTS_METHODS,
@@ -69,6 +68,7 @@ import { EventStreamRouter } from './events/stream-router';
 import { EventSubscription } from './events/subscription';
 import type { EventsPort, EventsWebhookSetup, MCPEventSubscribeOptions, MCPEventSubscription } from './events/types';
 import { getInputSchemaError, loadInputSchemaMetaValidator } from './input-schema-meta-schema';
+import { addProcessHook } from './process-hooks';
 import { interceptTaskResults, takeTaskHandle } from './tasks/intercept';
 import { resolveTasksOptions } from './tasks/options';
 import { TaskRequester } from './tasks/requester';
@@ -479,9 +479,7 @@ export class InternalMastraMCPClient extends MastraBase {
   private clientConnectionOnClose?: () => void;
   private _authState?: MCPServerAuthState;
   private operationContextStore = new AsyncLocalStorage<RequestContext | null>();
-  private exitHookUnsubscribe?: () => void;
-  private sigTermHandler?: () => void;
-  private sigHupHandler?: () => void;
+  private releaseProcessHook?: () => void;
   private serverInstructions?: string;
   private serverImplementation?: MCPServerImplementation;
   /** The verdict of the last successful probe, reused so reconnects skip it. */
@@ -1020,7 +1018,7 @@ export class InternalMastraMCPClient extends MastraBase {
     // Registered before the connection settles so an exit during a connect attempt still
     // tears down anything the transport already started (a spawned stdio child, say).
     // The failure path inside the promise removes them again. Hosts that own shutdown must
-    // skip even the first registration: exit-hook's global signal listeners outlive unsubscribe.
+    // skip even the first registration, since a registered hook ends the process on a signal.
     if (this.processHooks) {
       this.registerProcessHooks();
     }
@@ -1030,28 +1028,16 @@ export class InternalMastraMCPClient extends MastraBase {
 
   /**
    * Installs the process-exit and signal handlers that tear this client down when the
-   * host process goes away. Idempotent, so repeated connects add at most one of each.
+   * host process goes away. Idempotent, so repeated connects add at most one hook.
    */
   private registerProcessHooks() {
-    if (!this.exitHookUnsubscribe) {
-      this.exitHookUnsubscribe = asyncExitHook(
-        async () => {
-          this.log('debug', `Disconnecting MCP server during exit`);
-          await this.disconnect();
-        },
-        { wait: 5000 },
-      );
-    }
-
-    if (!this.sigTermHandler) {
-      this.sigTermHandler = () => gracefulExit();
-      process.on('SIGTERM', this.sigTermHandler);
-    }
-
-    if (!this.sigHupHandler) {
-      this.sigHupHandler = () => gracefulExit();
-      process.on('SIGHUP', this.sigHupHandler);
-    }
+    this.releaseProcessHook ??= addProcessHook(
+      async () => {
+        this.log('debug', `Disconnecting MCP server during exit`);
+        await this.disconnect();
+      },
+      { wait: 5000 },
+    );
   }
 
   /**
@@ -1060,18 +1046,8 @@ export class InternalMastraMCPClient extends MastraBase {
    * reached a transport still releases its process listeners.
    */
   private unregisterProcessHooks() {
-    if (this.exitHookUnsubscribe) {
-      this.exitHookUnsubscribe();
-      this.exitHookUnsubscribe = undefined;
-    }
-    if (this.sigTermHandler) {
-      process.off('SIGTERM', this.sigTermHandler);
-      this.sigTermHandler = undefined;
-    }
-    if (this.sigHupHandler) {
-      process.off('SIGHUP', this.sigHupHandler);
-      this.sigHupHandler = undefined;
-    }
+    this.releaseProcessHook?.();
+    this.releaseProcessHook = undefined;
   }
 
   /**
